@@ -1,6 +1,8 @@
 import time
 from decimal import ROUND_HALF_UP, Decimal
 
+from pywinauto import mouse
+
 from fakturama_automation.fakturama.app import FakturamaApp
 from fakturama_automation.fakturama.controls import (
     find_after_label,
@@ -13,6 +15,18 @@ from fakturama_automation.utils.logging import log
 from fakturama_automation.workflow.errors import AutomationError
 
 TWO_PLACES = Decimal("0.01")
+
+# Offsets (from the Items table's inner-pane top-left) that land inside the
+# Qty / U.Price / Discount cells of the first item row, calibrated against
+# the current maximized-window layout. Clicking here activates that cell's
+# inline editor -- the table exposes no row/column UIA structure at all
+# (see project memory), so there is no semantic way to locate these cells;
+# this is a deliberate, documented exception to "no fixed coordinates,"
+# only used for this one grid where no alternative exists.
+ROW1_Y_OFFSET = 37
+QTY_X_OFFSET = 83
+UPRICE_X_OFFSET = 863
+DISCOUNT_X_OFFSET = 933
 
 
 def _product_selector_icon(window):
@@ -108,6 +122,72 @@ def create_product(app: FakturamaApp, window, item: OrderItem, vat_name: str) ->
     save_btn.click_input()
 
     log.info(f"Created Product {item.sku!r} (gross price {gross_price})")
+
+
+def _items_table_pane(window):
+    descendants = window.descendants()
+    for i, el in enumerate(descendants):
+        ei = el.element_info
+        if ei.control_type == "Text" and ei.name == "Items":
+            for c in descendants[i:]:
+                cei = c.element_info
+                if cei.control_type == "Pane":
+                    return c
+            break
+    raise AutomationError("Items table pane not found")
+
+
+def _edit_row1_cell(app: FakturamaApp, window, x_offset: int, value: str):
+    """Click into row 1's cell at the given offset and type a new value.
+
+    Single-clicking an editable cell in this table activates an inline
+    Edit control in place (confirmed empirically for Qty/U.Price/Discount;
+    other columns either aren't editable this way or open a separate
+    popup, e.g. Description). The resulting control is located afterward
+    by its position, since it has no name.
+    """
+    pane = _items_table_pane(window)
+    rect = pane.rectangle()
+    x = rect.left + x_offset
+    y = rect.top + ROW1_Y_OFFSET
+
+    app.focus()
+    mouse.click(button="left", coords=(x, y))
+    time.sleep(0.4)
+
+    cell_edit = None
+    for el in window.descendants():
+        ei = el.element_info
+        if ei.control_type != "Edit":
+            continue
+        r = el.rectangle()
+        if abs(r.top - y) <= 15 and r.left <= x <= r.right:
+            cell_edit = el
+            break
+
+    if cell_edit is None:
+        raise AutomationError(f"No cell editor appeared at offset {x_offset}")
+
+    cell_edit.click_input()
+    cell_edit.type_keys("^a{DELETE}")
+    cell_edit.type_keys(value)
+    cell_edit.type_keys("{ENTER}")
+    time.sleep(0.3)
+
+
+def complete_order_line(app: FakturamaApp, window, item: OrderItem) -> None:
+    """Set Qty, U.Price, and Discount on the first (only) Order item row.
+
+    Assumes a single-item order (row 1) -- the offsets are calibrated for
+    that row specifically; see module docstring on the OFFSET constants.
+    """
+    _edit_row1_cell(app, window, QTY_X_OFFSET, str(item.quantity))
+    _edit_row1_cell(app, window, UPRICE_X_OFFSET, str(item.unit_net_price))
+    _edit_row1_cell(app, window, DISCOUNT_X_OFFSET, str(item.discount_percentage))
+    log.info(
+        f"Completed order line for {item.sku!r}: qty={item.quantity}, "
+        f"unit_net_price={item.unit_net_price}, discount={item.discount_percentage}%"
+    )
 
 
 def select_product_by_sku(app: FakturamaApp, window, sku: str) -> None:
