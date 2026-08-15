@@ -1,3 +1,5 @@
+import time
+
 import win32con
 import win32gui
 from pywinauto import Application
@@ -32,6 +34,17 @@ def _find_fakturama_hwnd(title_prefix: str = FAKTURAMA_TITLE_PREFIX) -> int:
     if len(matches) > 1:
         raise AutomationError(f"Multiple Fakturama windows found: {matches}")
     return matches[0]
+
+
+def _find_hwnd_by_exact_title(title: str) -> int | None:
+    matches: list[int] = []
+
+    def _enum_handler(hwnd: int, _):
+        if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd) == title:
+            matches.append(hwnd)
+
+    win32gui.EnumWindows(_enum_handler, None)
+    return matches[0] if matches else None
 
 
 class FakturamaApp:
@@ -89,6 +102,60 @@ class FakturamaApp:
     def find_control(self, parent=None, **criteria):
         parent = parent or self.main_window
         return parent.child_window(**criteria)
+
+    def close_tab(self, tab_title: str, timeout: float = 10):
+        """Close a document tab via Ctrl+F4.
+
+        If the tab has unsaved changes, Fakturama prompts with a "Save
+        Parts" dialog; its OK button saves the checked items and proceeds
+        with the close, while Cancel aborts the close entirely (leaving the
+        tab open and still dirty). There is no plain discard option
+        exposed here, so this always saves.
+        """
+        try:
+            tab_item = self.main_window.child_window(title=tab_title, control_type="TabItem")
+            tab_item.wait("visible", timeout=2)
+        except Exception:
+            return  # nothing to close
+
+        self.focus()
+        tab_item.click_input()
+        time.sleep(0.3)
+        self.main_window.type_keys("^{F4}")
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            hwnd = _find_hwnd_by_exact_title("Save Parts")
+            if hwnd:
+                dlg_app = Application(backend="uia").connect(handle=hwnd)
+                dlg = dlg_app.window(handle=hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+                ok = dlg.child_window(title="OK", control_type="Button")
+                ok.wait("visible enabled", timeout=5)
+                ok.click_input()
+                return
+            time.sleep(0.2)
+
+    def dismiss_dialog_if_present(self, title: str, button: str = "OK", wait: float = 0.5):
+        """Click a named button on a transient top-level dialog if it's open.
+
+        Fakturama pops native message boxes for things like "Duplicate
+        Contact" as a live-validation warning while filling in a form, not
+        just on save. These are separate top-level windows (unlike the
+        "address type" role popup), so they're found by exact title via
+        win32, not through the main window's UIA tree.
+        """
+        hwnd = _find_hwnd_by_exact_title(title)
+        if not hwnd:
+            return False
+        dlg_app = Application(backend="uia").connect(handle=hwnd)
+        dlg = dlg_app.window(handle=hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        btn = dlg.child_window(title=button, control_type="Button")
+        btn.wait("visible enabled", timeout=5)
+        btn.click_input()
+        time.sleep(wait)
+        return True
 
     def take_screenshot(self, name: str):
         return take_screenshot(self.hwnd, name)
