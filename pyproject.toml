@@ -1,0 +1,23 @@
+[project]
+name = "fakturama-automation"
+version = "0.1.0"
+description = "Image-to-cash automation for Fakturama via UI Automation"
+requires-python = ">=3.11"
+dependencies = [
+    "pywinauto>=0.6.8",
+    "pywin32>=306",
+    "pydantic>=2.7",
+    "openai>=1.30",
+    "pillow>=10.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
