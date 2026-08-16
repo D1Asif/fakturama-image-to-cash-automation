@@ -7,7 +7,7 @@ dependencies = [
     "pywinauto>=0.6.8",
     "pywin32>=306",
     "pydantic>=2.7",
-    "openai>=1.30",
+    "openai>=1.68",
     "pillow>=10.0",
     "python-dotenv>=1.0",
 ]

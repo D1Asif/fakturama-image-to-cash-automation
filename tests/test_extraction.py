@@ -57,8 +57,8 @@ def sample_image(tmp_path: Path) -> Path:
 def _mock_client(content: str) -> MagicMock:
     client = MagicMock()
     response = MagicMock()
-    response.choices = [MagicMock(message=MagicMock(content=content))]
-    client.chat.completions.create.return_value = response
+    response.output_text = content
+    client.responses.create.return_value = response
     return client
 
 

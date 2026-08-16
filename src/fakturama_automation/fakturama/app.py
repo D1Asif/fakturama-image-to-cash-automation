@@ -85,6 +85,26 @@ class FakturamaApp:
             win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
         win32gui.SetForegroundWindow(self.hwnd)
 
+    def force_redraw(self):
+        """Force a full SWT layout recalculation via a restore/maximize
+        cycle -- the only thing found that reliably fixes a specific,
+        confirmed-live Fakturama rendering bug: after a second (or later)
+        item row is added to an Order's Items table via the product
+        selector, the row is genuinely present in the underlying data
+        (confirmed independently via the Order's own computed Total Net
+        changing to include it) but is not painted in the grid, so no
+        Qty/U.Price/Discount cell exists to click at its expected position.
+        Scrolling the pane, switching tabs away and back, and probing nearby
+        Y-offsets for a misplaced row were all tried first and did not
+        help -- only a full window restore+maximize forced Fakturama to
+        repaint it.
+        """
+        win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+        time.sleep(0.5)
+        win32gui.ShowWindow(self.hwnd, win32con.SW_MAXIMIZE)
+        time.sleep(1.0)
+        self.focus()
+
     def click(self, parent=None, timeout: float = 10, **criteria):
         control = self.wait_for_control(parent, timeout=timeout, **criteria)
         self.wait_until_enabled(control, timeout=timeout)
@@ -156,6 +176,46 @@ class FakturamaApp:
         btn.click_input()
         time.sleep(wait)
         return True
+
+    def check_for_save_error(self) -> str | None:
+        """Check whether a native "Error in ..." dialog appeared after a
+        Save click, dismiss it if so, and return its message.
+
+        Fakturama validates auto-generated identifiers (Order/Invoice No.,
+        Debtor Customer ID) as strictly sequential -- if its own proposed
+        next value has gone stale (observed live: several dirty tabs open
+        at once, each having separately proposed the same "next" number),
+        Save fails outright with a dialog titled "Error in document
+        number" or "Error in customer ID" and the record is NOT saved.
+        Every save_*() function in this codebase used to click Save and
+        immediately log success with no check for this at all -- a save
+        that actually failed would be reported as having succeeded,
+        letting the workflow continue against data that was never
+        persisted. This closes that gap; callers should raise on a
+        non-None return rather than proceed.
+
+        Returns None if no such dialog is present (the normal case).
+        """
+        for title in ("Error in document number", "Error in customer ID"):
+            hwnd = _find_hwnd_by_exact_title(title)
+            if not hwnd:
+                continue
+            dlg_app = Application(backend="uia").connect(handle=hwnd)
+            dlg = dlg_app.window(handle=hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+
+            message = title
+            for el in dlg.descendants():
+                ei = el.element_info
+                if ei.control_type == "Text" and ei.name:
+                    message = ei.name
+                    break
+
+            ok = dlg.child_window(title="OK", control_type="Button")
+            ok.wait("visible enabled", timeout=5)
+            ok.click_input()
+            return message
+        return None
 
     def take_screenshot(self, name: str):
         return take_screenshot(self.hwnd, name)

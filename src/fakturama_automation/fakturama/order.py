@@ -140,8 +140,30 @@ def reassert_header(app: FakturamaApp, window, order: OrderData) -> None:
         select_combo_option(app, window, price_mode, PRICE_MODE_NET)
 
 
-def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3):
-    """Verify totals, re-assert header fields, and save.
+def switch_to_order_tab(app: FakturamaApp, window):
+    """Click back onto the (still-open, not yet saved) New Order tab.
+
+    Needed after any excursion to another editor (Debtor/Product/VAT/etc.)
+    that changes which tab is active -- searches like `find_after_label`
+    and the address/product selector icons only find the right controls
+    when the Order tab is actually the visible one.
+    """
+    for title in ("*New Order", "New Order"):
+        try:
+            tab_item = window.child_window(title=title, control_type="TabItem")
+            tab_item.wait("visible", timeout=1)
+            app.focus()
+            tab_item.click_input()
+            return
+        except Exception:
+            continue
+    raise AutomationError("Could not find the open New Order tab to switch back to")
+
+
+def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3) -> str:
+    """Verify totals, re-assert header fields, and save. Returns the
+    Fakturama-assigned Order number (e.g. "PO000029") for the caller to use
+    when verifying the saved record in Data > Documents.
 
     Date has been observed reverting to today's date from multiple
     distinct triggers (price-mode change, address-dialog interaction, the
@@ -164,6 +186,15 @@ def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3):
         save_btn.click_input()
         app.dismiss_dialog_if_present("Duplicate Contact")
 
+        save_error = app.check_for_save_error()
+        if save_error:
+            raise AutomationError(
+                f"Order save failed: {save_error} -- Fakturama's proposed Order No. has likely "
+                "gone stale (seen after many dirty tabs accumulate in one session); restarting "
+                "Fakturama has reliably cleared this. Not retrying: the same stale number would "
+                "just fail again."
+            )
+
         date_field = find_after_label(window, "Date", "Edit")
         if date_field.get_value() == expected_date_text:
             date_confirmed = True
@@ -180,3 +211,6 @@ def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3):
         "though it reads correctly right after Save -- not resolved in this session. "
         "Re-verify Date from a fresh connection before treating this Order as final."
     )
+
+    no_field = find_after_label(window, "No.", "Edit")
+    return no_field.get_value()

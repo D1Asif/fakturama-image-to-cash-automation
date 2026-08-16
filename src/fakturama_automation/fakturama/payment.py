@@ -1,8 +1,14 @@
+import time
+
 from fakturama_automation.fakturama.app import FakturamaApp
-from fakturama_automation.fakturama.controls import find_after_label, set_text, type_select_combo
+from fakturama_automation.fakturama.controls import (
+    find_after_label,
+    read_grid_rows_via_clipboard,
+    select_combo_option,
+    set_text,
+)
 from fakturama_automation.utils.logging import log
-from fakturama_automation.utils.waits import wait_for_results_stable
-from fakturama_automation.workflow.errors import ManualReviewRequired
+from fakturama_automation.workflow.errors import AutomationError, ManualReviewRequired
 
 PAYMENT_CODES = {
     "Bank Transfer": "Credit transfer",
@@ -11,6 +17,13 @@ PAYMENT_CODES = {
 }
 
 PAYMENT_CODE_COMBO_TITLE = "!editorPaymentPaymentcode!"
+
+# Click point (offset from the "terms of payment" pane's own top-left)
+# landing inside the results grid below the Search box -- calibrated live
+# the same way as the other grid offsets in this project (see project
+# memory: no UIA row/column structure exists to locate this semantically).
+_GRID_X_OFFSET = 100
+_GRID_Y_OFFSET = 260
 
 
 def _open_terms_of_payment_tab(app: FakturamaApp, window):
@@ -29,14 +42,19 @@ def _open_terms_of_payment_tab(app: FakturamaApp, window):
     app.click(title="terms of payment", control_type="Text")
 
 
-def _read_payment_rows(pane) -> list[dict]:
-    rows = []
-    for item in pane.descendants():
-        if item.element_info.control_type != "DataItem":
-            continue
-        text = item.window_text() or ",".join(item.texts())
-        rows.append({"name": text, "_element": item})
-    return rows
+def _read_payment_rows(app: FakturamaApp, tab) -> list[list[str]]:
+    """Read every row of the terms-of-payment results grid via clipboard
+    copy. Columns, confirmed live: Standard | Name | Description | Cash
+    discount | Discount Days | Net Days.
+
+    Replaces an earlier DataItem-based descendants() walk that always
+    returned zero rows -- this grid has no UIA row structure at all, the
+    same limitation confirmed exhaustively for the Debtor/Product/VAT
+    grids (see project memory and read_grid_rows_via_clipboard()).
+    """
+    rect = tab.rectangle()
+    x, y = rect.left + _GRID_X_OFFSET, rect.top + _GRID_Y_OFFSET
+    return read_grid_rows_via_clipboard(app, x, y)
 
 
 def ensure_payment_method(app: FakturamaApp, window, method: str) -> bool:
@@ -51,10 +69,10 @@ def ensure_payment_method(app: FakturamaApp, window, method: str) -> bool:
 
     search = find_after_label(tab, "Search:", "Edit")
     set_text(search, method, verify=False)
+    time.sleep(1.2)  # let the async search filter settle before reading
 
-    wait_for_results_stable(lambda: len(_read_payment_rows(tab)), timeout=10, stable_for=0.7)
-    rows = _read_payment_rows(tab)
-    exact = [r for r in rows if r["name"].strip() == method.strip()]
+    rows = _read_payment_rows(app, tab)
+    exact = [r for r in rows if len(r) >= 2 and r[1].strip() == method.strip()]
 
     if len(exact) > 1:
         app.take_error_screenshot("ambiguous_payment_method")
@@ -75,13 +93,31 @@ def ensure_payment_method(app: FakturamaApp, window, method: str) -> bool:
     description = payment_tab.child_window(title="Description", control_type="Edit")
     set_text(description, method)
 
+    # Confirmed live: this combo's list is NOT alphabetically sorted (it's
+    # a fixed 12-entry e-invoice payment-means-code list in a semantic,
+    # not alphabetical, order -- 'In cash', 'Credit transfer', 'Debit
+    # transfer', 'Bank card', 'Direct debit', 'Credit card', 'Debit card',
+    # 'Standing agreement', 'SEPA credit transfer', 'SEPA direct debit', ...).
+    # type_select_combo()'s anchor-then-step algorithm assumes alphabetical
+    # order to pick a direction and landed on the wrong entry ("Debit card"
+    # instead of "SEPA direct debit") when tried here. Since the list is
+    # short and fixed (not virtualized/open-ended like Country), the
+    # click-and-pick-ListItem approach (select_combo_option, same as the
+    # VAT-code combo below) is both correct and simpler -- confirmed live
+    # that opening this combo does expose real ListItems, contrary to an
+    # earlier note in project memory.
     code_combo = payment_tab.child_window(title=PAYMENT_CODE_COMBO_TITLE, control_type="ComboBox")
-    type_select_combo(app, code_combo, PAYMENT_CODES[method])
+    select_combo_option(app, window, code_combo, PAYMENT_CODES[method])
 
     for label in ("Cash discount", "Discount Days", "Net Days"):
         field = payment_tab.child_window(title=label, control_type="Edit")
         set_text(field, "0")
 
     app.click(title="Save the current contents", control_type="Button")
+
+    save_error = app.check_for_save_error()
+    if save_error:
+        raise AutomationError(f"Payment method save failed: {save_error}")
+
     log.info(f"Created payment method {method!r}")
     return False

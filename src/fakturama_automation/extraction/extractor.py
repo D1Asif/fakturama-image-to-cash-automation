@@ -11,7 +11,7 @@ from fakturama_automation.models.order import OrderData
 from fakturama_automation.utils.logging import log
 from fakturama_automation.workflow.errors import ExtractionError
 
-MODEL = "gpt-4o"
+MODEL = "gpt-5.4-mini"
 
 EXTRACTION_PROMPT = """You are reading a single order document image (purchase order, sales
 order, or similar). Extract ONLY the data visible on the document. Do not invent values, and
@@ -24,6 +24,14 @@ Return the following fields, matching this exact JSON schema:
 - debtor: company, first_name, last_name, alias (nullable),
   billing_address: {street, zip, city, country, email (nullable), telephone (nullable)},
   delivery_address: {street, zip, city, country, email (nullable), telephone (nullable)}
+
+  The customer's contact email and telephone are frequently printed in a
+  separate "Contact" section rather than physically inside the address
+  block. If the document shows one email/phone for the customer as a
+  whole (not a separate one per address), fill it into both
+  billing_address.email/telephone and delivery_address.email/telephone --
+  do not leave these null just because they weren't printed on the same
+  lines as the street/city.
 - payment: method, status ("PAID" or "UNPAID"), payment_date (YYYY-MM-DD, nullable)
 - items: list of {sku, description, quantity, unit_net_price, vat_percentage,
   discount_percentage, source_total}
@@ -57,27 +65,44 @@ def extract_order(image_path: str | Path, client: OpenAI | None = None) -> Order
 
     log.info(f"Starting order extraction from {image_path.name}")
 
+    # Uses the Responses API (OpenAI's current recommended API, superseding
+    # Chat Completions) rather than client.chat.completions.create(). Shape
+    # differences: instructions carries what used to be the system message;
+    # input takes input_image/input_text parts (a flat image_url string, not
+    # {"url": ...}); response_format is now nested under text.format; and
+    # the output is read via the output_text convenience property rather
+    # than choices[0].message.content.
+    #
+    # text.format type "json_object" requires the word "json" to appear in
+    # the *input* messages specifically -- confirmed live: instructions
+    # alone (which does say "JSON") isn't enough, the API 400s with "Response
+    # input messages must contain the word 'json' in some form" until an
+    # input_text part mentioning it is added alongside the image.
     try:
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model=MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": EXTRACTION_PROMPT},
+            instructions=EXTRACTION_PROMPT,
+            input=[
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        }
+                            "type": "input_text",
+                            "text": "Extract this order as JSON, following the schema and rules above.",
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{mime_type};base64,{encoded}",
+                        },
                     ],
                 },
             ],
+            text={"format": {"type": "json_object"}},
         )
     except Exception as exc:
         raise ExtractionError(f"Vision API call failed: {exc}") from exc
 
-    raw_content = response.choices[0].message.content
+    raw_content = response.output_text
     try:
         payload = json.loads(raw_content)
     except json.JSONDecodeError as exc:
