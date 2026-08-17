@@ -6,7 +6,7 @@ from fakturama_automation.fakturama.app import FakturamaApp
 from fakturama_automation.fakturama.controls import (
     find_after_label,
     select_combo_option,
-    set_text,
+    set_segmented_date,
     type_text_via_keyboard,
 )
 from fakturama_automation.models.order import OrderData
@@ -95,7 +95,10 @@ def apply_payment(app: FakturamaApp, window, tab, order: OrderData) -> None:
         expected = _format_date(order.payment.payment_date)
         paid_date_field = find_after_label(tab, "at", "Edit")
         if paid_date_field.get_value() != expected:
-            set_text(paid_date_field, expected)
+            # Same masked DateTime spinner as the Order's Date field --
+            # see set_segmented_date()'s docstring for why set_text()
+            # looked correct here but silently failed to persist.
+            set_segmented_date(paid_date_field, order.payment.payment_date)
 
     # Value auto-populates to the Invoice Total once "paid" is checked, but
     # that was only ever an observed assumption, never enforced -- read it

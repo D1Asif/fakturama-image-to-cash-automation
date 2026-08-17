@@ -10,7 +10,7 @@ from fakturama_automation.fakturama import vat as vat_mod
 from fakturama_automation.fakturama.app import FakturamaApp
 from fakturama_automation.models.order import OrderData, OrderItem
 from fakturama_automation.utils.logging import log
-from fakturama_automation.workflow.errors import AutomationError
+from fakturama_automation.workflow.errors import AutomationError, ManualReviewRequired
 
 
 def run(app: FakturamaApp, order: OrderData) -> None:
@@ -27,6 +27,13 @@ def run(app: FakturamaApp, order: OrderData) -> None:
     """
     window = app.main_window
 
+    if len(order.items) > product_mod.MAX_AUTO_EDITABLE_ITEMS:
+        raise ManualReviewRequired(
+            f"Order has {len(order.items)} line items; the Items table's editing automation is only "
+            f"reliable up to {product_mod.MAX_AUTO_EDITABLE_ITEMS} (see product_mod.MAX_AUTO_EDITABLE_ITEMS "
+            "docstring) -- larger orders risk a silent wrong-row write and need manual entry instead."
+        )
+
     try:
         log.info("Opening new Order")
         order_mod.open_new_order(app, order)
@@ -40,6 +47,15 @@ def run(app: FakturamaApp, order: OrderData) -> None:
                 vat_names[item.vat_percentage] = vat_mod.ensure_vat(app, window, item.vat_percentage)
                 order_mod.switch_to_order_tab(app, window)
             _resolve_product(app, window, item, vat_names[item.vat_percentage])
+
+        # All lines must exist in the Order before editing any of them --
+        # prepare_items_grid_for_editing forces Fakturama to paint every
+        # row beyond the first (never happens on its own, no matter how
+        # long complete_order_line waits before its first click), so
+        # editing needs to happen only after every item has been added.
+        product_mod.prepare_items_grid_for_editing(app, window)
+
+        for row_index, item in enumerate(order.items, start=1):
             product_mod.complete_order_line(app, window, item, row_index)
 
         log.info("Saving Order")

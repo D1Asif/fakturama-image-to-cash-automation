@@ -1,5 +1,6 @@
+import re
 import time
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from pywinauto import mouse
 
@@ -37,6 +38,22 @@ ROW_HEIGHT = 25
 QTY_X_OFFSET = 83
 UPRICE_X_OFFSET = 863
 DISCOUNT_X_OFFSET = 933
+
+# The Items table's own viewport only ever paints ~3 rows at once
+# (ROW1_Y_OFFSET + 3*ROW_HEIGHT already exceeds its fixed pane height), so
+# rows beyond the third require genuine scrolling rather than the one-time
+# "nudge the scrollbar to force a repaint" fix that reliably handles rows
+# 1-3 (see prepare_items_grid_for_editing). Confirmed live that once real
+# scrolling is involved, the grid's scroll position isn't stable across
+# separate interactions -- e.g. switching tabs away and back resets it,
+# and successive clicks within the *same* row's three fields can each
+# land on a different actual row than intended, silently. Making that
+# reliable would need re-verifying which row is actually being edited by
+# content (e.g. via the clipboard-read technique) after every single
+# field write, not just position-based targeting -- not implemented, so
+# orders beyond this size are deliberately routed to manual review instead
+# of risking a silent wrong-row write.
+MAX_AUTO_EDITABLE_ITEMS = 3
 
 # Click point (offset from the "Select a product" dialog's own top-left)
 # landing inside the results grid below the Search box -- same dialog
@@ -203,19 +220,137 @@ def _row_cell_point(window, row_index: int, x_offset: int) -> tuple[int, int]:
     return x, y
 
 
+def _nudge_items_grid_scrollbar(window, max_clicks: int = 40) -> int:
+    """Click the Items grid's own vertical-scrollbar "Line down" button
+    repeatedly until it disappears (nothing left to scroll) or max_clicks
+    is reached. Returns the number of clicks performed.
+
+    Root-caused live: a freshly-added Order line beyond row 1 exists in
+    the data model immediately (the Order's own Total Net already
+    reflects its default price) but Fakturama simply never paints it --
+    not a coordinate-calculation bug, not a timing issue. Waiting longer,
+    switching tabs away and back, scrolling by other means, and a window
+    restore+maximize cycle were all tried first and none reliably fixed
+    it. Clicking this specific scrollbar button does: each click forces
+    SWT to lay out one more row, and once every added row has been
+    painted this way, plain coordinate clicks work normally against all
+    of them (Qty, U.Price, Discount alike) for the rest of the run --
+    confirmed against both 2-item and 3-item orders with exact Total Net
+    matches and zero retries needed afterward.
+
+    The button is relocated from the *current* Items pane rect on every
+    click rather than cached, since nudging shifts the pane's own
+    position (the surrounding form reflows as the grid grows).
+    """
+    clicked = 0
+    for _ in range(max_clicks):
+        pane = _items_table_pane(window)
+        rect = pane.rectangle()
+        button = None
+        for el in window.descendants():
+            ei = el.element_info
+            if ei.control_type != "Button" or ei.name != "Line down":
+                continue
+            r = el.rectangle()
+            if rect.right - 5 <= r.left <= rect.right + 40 and rect.top - 10 <= r.top <= rect.bottom + 60:
+                button = el
+                break
+        if button is None:
+            break
+        button.click_input()
+        clicked += 1
+        time.sleep(0.5)
+    return clicked
+
+
+def prepare_items_grid_for_editing(app: FakturamaApp, window) -> None:
+    """Call once after every line item has been added to the Order (i.e.
+    after the resolve_product/create_product + select_product_by_sku pass
+    for every item), before calling complete_order_line for any of them.
+
+    See _nudge_items_grid_scrollbar for why this is necessary -- rows
+    beyond the first are otherwise never painted, regardless of how long
+    complete_order_line waits before its first click.
+    """
+    app.focus()
+    nudged = _nudge_items_grid_scrollbar(window)
+    log.info(f"Items grid scrollbar nudged {nudged} time(s) to render all order lines")
+
+
+_MAX_CELL_EDIT_HEIGHT = 40  # genuine inline cell editors are ~24-25px tall
+
+
 def _find_cell_edit(window, x: int, y: int):
+    """Find the small inline Edit control activated by clicking a table
+    cell at (x, y).
+
+    Rejects any Edit taller than a genuine cell editor: root-caused live
+    that without this, a click at a row-2 position can silently match the
+    much larger Remarks textbox below the table instead of a real (but not
+    actually rendered) cell -- both satisfy "Edit control within 15px of
+    the target row's top, x within its horizontal bounds", since the
+    Remarks box is wide enough to span multiple columns' worth of X
+    offsets. That gave false "success": the write really landed, and read
+    back correctly, just in the Remarks field, not the intended cell --
+    confirmed live via a stray "3" appearing in Remarks after a Qty write
+    that otherwise looked entirely successful (no retry, no error).
+    """
     for el in window.descendants():
         ei = el.element_info
         if ei.control_type != "Edit":
             continue
         r = el.rectangle()
+        if r.bottom - r.top > _MAX_CELL_EDIT_HEIGHT:
+            continue
         if abs(r.top - y) <= 15 and r.left <= x <= r.right:
             return el
     return None
 
 
-def _edit_row_cell(app: FakturamaApp, window, row_index: int, x_offset: int, value: str):
-    """Click into the given row's cell at the given offset and type a new value.
+def _read_row_cell(app: FakturamaApp, window, x: int, y: int) -> str | None:
+    """Click into the cell at (x, y), read its current value, and back out
+    via Escape. Returns None if no cell editor appears there at all.
+    """
+    app.focus()
+    mouse.click(button="left", coords=(x, y))
+    time.sleep(0.3)
+    cell_edit = _find_cell_edit(window, x, y)
+    if cell_edit is None:
+        return None
+    value = cell_edit.get_value()
+    window.type_keys("{ESC}")
+    time.sleep(0.2)
+    return value
+
+
+def _cell_value_matches(actual: str, expected: str) -> bool:
+    """Compare a cell's read-back display text (e.g. "3.00", "USD 40",
+    "10.00 %") against the plain value that was typed, tolerating whatever
+    formatting Fakturama adds on commit. Numeric comparison via Decimal
+    (so "3.00" == "3", "USD 40" == "40.00") with a substring-containment
+    fallback -- the same tolerance already used elsewhere in this project
+    (type_text_via_keyboard) for fields that auto-append formatting --
+    for the rare case either side isn't a plain number.
+
+    Compares by absolute value: confirmed live that the Discount column
+    reads back with a leading minus sign representing the reduction (typed
+    "10", read back "-10.00 %") even though the write is genuinely
+    correct -- confirmed via the Order's own Total Net reflecting the
+    discount correctly applied. None of the fields this project writes to
+    this table (Qty, U.Price, Discount) are ever meant to be negative, so
+    comparing magnitudes only is safe here and isn't hiding a real class of
+    error.
+    """
+    numeric = re.sub(r"[^0-9.\-]", "", actual)
+    try:
+        return abs(Decimal(numeric)) == abs(Decimal(expected))
+    except InvalidOperation:
+        return expected in actual
+
+
+def _edit_row_cell(app: FakturamaApp, window, row_index: int, x_offset: int, value: str, attempts: int = 4):
+    """Click into the given row's cell at the given offset, type a new
+    value, and verify it actually persisted before returning.
 
     Single-clicking an editable cell in this table activates an inline
     Edit control in place (confirmed empirically for Qty/U.Price/Discount;
@@ -226,52 +361,102 @@ def _edit_row_cell(app: FakturamaApp, window, row_index: int, x_offset: int, val
     scroll/layout position (observed live between calls) doesn't throw off
     the row math the way a cached rectangle would.
 
-    Row 2+ can fail to appear at all here even though it genuinely exists
-    in the Order's data (confirmed live: the Order's own Total Net already
-    reflected the second item's default price before this ever ran). This
-    is a real Fakturama grid-repaint bug, not a coordinate-calculation
-    error -- scrolling the pane, switching tabs away and back, keyboard
-    row-navigation, and probing a wide range of nearby Y-offsets were all
-    tried first and none of them revealed the row. A window restore+
-    maximize cycle (force_redraw) did reveal it, once -- but retesting the
-    identical sequence afterward, several times, did not reliably
-    reproduce that fix, so this is NOT a solved problem, just one where
-    retrying with a redraw occasionally helps and costs little when it
-    doesn't. Retries a few times with a redraw before each attempt after
-    the first, rather than assuming one redraw is sufficient.
+    Two distinct failure modes are handled here, both confirmed live:
+
+    1. Row 2+ can fail to appear at all even though it genuinely exists in
+       the Order's data (confirmed: the Order's own Total Net already
+       reflected the second item's default price before this ever ran) --
+       a real Fakturama grid-repaint bug, not a coordinate-calculation
+       error. Scrolling the pane, switching tabs away and back, keyboard
+       row-navigation, and probing a wide range of nearby Y-offsets were
+       all tried first and none of them revealed the row; a window
+       restore+maximize cycle (force_redraw) did, sometimes.
+    2. Even when a cell editor *is* found and accepts keystrokes with no
+       error, the typed value can silently fail to persist -- confirmed
+       live: after a force_redraw-recovered editor accepted "3" with no
+       exception, the row's actual Qty stayed at its default "1" instead.
+       Same "looks like it worked, didn't persist" bug class already
+       documented elsewhere in this project for Company/VAT-Value/
+       Product-Price, newly confirmed for this table too. A single write
+       is therefore never trusted -- this always re-opens the same cell
+       afterward and reads back what actually landed.
+    2b. An immediate readback isn't enough either -- confirmed live: a
+       readback taken right after commit matched the intended value (no
+       retry was even logged), yet the value found in the *saved* record
+       minutes later had reverted to the default anyway. This points to a
+       delayed reversion (async validation/recalculation on Fakturama's
+       side) racing an immediate check, not a one-shot persistence
+       failure. So a matching immediate readback is only provisional here
+       -- this waits and re-reads a second time before trusting it, and
+       only accepts the write if *both* checks agree.
+
+    Neither failure mode has a fix that's been shown to work reliably, so
+    this retries the whole click-type-verify cycle, forcing a redraw
+    between attempts, and only gives up (raising) after `attempts` tries
+    -- silently accepting an unverified write is worse than a slower,
+    honest failure, per this project's "never silently guess" principle.
     """
-    last_x = last_y = None
-    for attempt in range(4):
+    last_actual: str | None = None
+    for attempt in range(attempts):
         x, y = _row_cell_point(window, row_index, x_offset)
-        last_x, last_y = x, y
 
         app.focus()
         mouse.click(button="left", coords=(x, y))
         time.sleep(0.4)
 
         cell_edit = _find_cell_edit(window, x, y)
-        if cell_edit is not None:
-            break
+        if cell_edit is None:
+            log.info(f"No cell editor appeared at row {row_index}, offset {x_offset} (attempt {attempt + 1}/{attempts})")
+            if attempt < attempts - 1:
+                app.force_redraw()
+            continue
 
-        log.info(f"No cell editor appeared at row {row_index}, offset {x_offset} (attempt {attempt + 1}/4)")
-        if attempt < 3:
+        cell_edit.click_input()
+        cell_edit.type_keys("^a{DELETE}")
+        cell_edit.type_keys(value)
+        cell_edit.type_keys("{ENTER}")
+        time.sleep(0.3)
+
+        # Re-open the same cell to confirm the write actually stuck,
+        # rather than trusting that no exception means it did.
+        last_actual = _read_row_cell(app, window, x, y)
+        if last_actual is not None and _cell_value_matches(last_actual, value):
+            # An immediate match is only provisional (see docstring 2b) --
+            # give any delayed/async reversion a chance to happen, then
+            # check again before actually trusting it.
+            time.sleep(1.5)
+            confirmed_actual = _read_row_cell(app, window, x, y)
+            if confirmed_actual is not None and _cell_value_matches(confirmed_actual, value):
+                return
+            last_actual = confirmed_actual
+            log.info(
+                f"Row {row_index} offset {x_offset}: wrote {value!r}, immediate readback matched but "
+                f"reverted to {last_actual!r} after settling (attempt {attempt + 1}/{attempts}), retrying"
+            )
+        else:
+            log.info(
+                f"Row {row_index} offset {x_offset}: wrote {value!r} but readback was {last_actual!r} "
+                f"(attempt {attempt + 1}/{attempts}), retrying"
+            )
+
+        if attempt < attempts - 1:
             app.force_redraw()
-    else:
-        raise AutomationError(
-            f"No cell editor appeared at row {row_index}, offset {x_offset} after 4 attempts with redraws "
-            f"(last click point: {(last_x, last_y)}) -- known Fakturama grid-repaint issue, see project docs"
-        )
 
-    cell_edit.click_input()
-    cell_edit.type_keys("^a{DELETE}")
-    cell_edit.type_keys(value)
-    cell_edit.type_keys("{ENTER}")
-    time.sleep(0.3)
+    raise AutomationError(
+        f"Could not verify write to row {row_index}, offset {x_offset}: expected {value!r}, "
+        f"last readback was {last_actual!r} after {attempts} attempts"
+    )
 
 
 def complete_order_line(app: FakturamaApp, window, item: OrderItem, row_index: int = 1) -> None:
     """Set Qty, U.Price, and Discount on the given Order item row (1-based,
     matching source order).
+
+    Requires prepare_items_grid_for_editing(app, window) to have been
+    called once already, after every line item was added to the Order and
+    before this is called for any of them -- otherwise row 2+ generally
+    won't be painted yet and every cell click on it will fail to find an
+    editor.
 
     Row position (Qty/U.Price/Discount cells) is computed from
     ROW1_Y_OFFSET + (row_index-1)*ROW_HEIGHT so this works for every line
@@ -311,9 +496,43 @@ def complete_order_line(app: FakturamaApp, window, item: OrderItem, row_index: i
     Price and VAT correctness instead -- a wrong VAT or Price on any line
     would surface there as a totals mismatch.
     """
-    _edit_row_cell(app, window, row_index, QTY_X_OFFSET, str(item.quantity))
-    _edit_row_cell(app, window, row_index, UPRICE_X_OFFSET, str(item.unit_net_price))
-    _edit_row_cell(app, window, row_index, DISCOUNT_X_OFFSET, str(item.discount_percentage))
+    fields = [
+        (QTY_X_OFFSET, str(item.quantity)),
+        (UPRICE_X_OFFSET, str(item.unit_net_price)),
+        (DISCOUNT_X_OFFSET, str(item.discount_percentage)),
+    ]
+    for x_offset, value in fields:
+        _edit_row_cell(app, window, row_index, x_offset, value)
+
+    # Writing a later cell in this row has been observed to silently
+    # revert an earlier one, even though _edit_row_cell's own immediate
+    # *and* delayed readback both confirmed it correct at the time -- the
+    # same "a later action clobbers an earlier field" pattern already
+    # documented for the Order Date field (order.py::reassert_header),
+    # just discovered here for Qty specifically (confirmed live: Qty
+    # verified correctly right after being written, then read back as its
+    # untouched default once Discount had also been written). Re-check
+    # every field in the row together now that all three are done, and
+    # re-write any that drifted, since a per-field check alone isn't
+    # sufficient insurance against a cross-field side effect.
+    mismatches: list[tuple[int, str, str | None]] = []
+    for reassert_attempt in range(3):
+        mismatches = []
+        for x_offset, value in fields:
+            x, y = _row_cell_point(window, row_index, x_offset)
+            actual = _read_row_cell(app, window, x, y)
+            if actual is None or not _cell_value_matches(actual, value):
+                mismatches.append((x_offset, value, actual))
+
+        if not mismatches:
+            break
+
+        log.info(f"Row {row_index} drifted after completion (attempt {reassert_attempt + 1}/3): {mismatches}")
+        for x_offset, value, _actual in mismatches:
+            _edit_row_cell(app, window, row_index, x_offset, value)
+    else:
+        raise AutomationError(f"Row {row_index} fields kept drifting after 3 reassert passes: {mismatches}")
+
     log.info(
         f"Completed order line {row_index} for {item.sku!r}: qty={item.quantity}, "
         f"unit_net_price={item.unit_net_price}, discount={item.discount_percentage}%"

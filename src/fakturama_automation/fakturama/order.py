@@ -6,6 +6,7 @@ from fakturama_automation.fakturama.controls import (
     find_after_label,
     find_price_mode_combo,
     select_combo_option,
+    set_segmented_date,
     set_text,
 )
 from fakturama_automation.models.order import OrderData
@@ -60,9 +61,8 @@ def open_new_order(app: FakturamaApp, order: OrderData):
     cust_ref = window.child_window(title="Cust.Ref.", control_type="Edit")
     set_text(cust_ref, order.external_reference)
 
-    expected_date_text = _format_date(order.order_date)
     date_field = find_after_label(window, "Date", "Edit")
-    set_text(date_field, expected_date_text)
+    set_segmented_date(date_field, order.order_date)
 
     _verify_header(window, order)
     log.info(f"New Order opened, Cust.Ref set to {order.external_reference}")
@@ -120,10 +120,15 @@ def verify_order_totals(window, order: OrderData) -> None:
 
 def reassert_header(app: FakturamaApp, window, order: OrderData) -> None:
     """Re-check and, if drifted, re-set Cust.Ref/Date/price mode right
-    before saving. Field-write ordering elsewhere already avoids the known
-    "recalculation clobbers Date" issue, but this is cheap insurance
-    against it recurring from an interaction not yet identified as a
-    trigger (see project memory).
+    before saving.
+
+    Date now goes through set_segmented_date() (see controls.py), which
+    fixed the actual root cause of the long-standing Date-reversion bug --
+    set_text() wrote the display text without syncing Fakturama's
+    underlying model, which is why the field always looked right
+    immediately but reverted later. This re-check is now cheap insurance
+    against drift from some other, not-yet-identified trigger, not the
+    primary defense it used to be.
     """
     cust_ref = window.child_window(title="Cust.Ref.", control_type="Edit")
     if cust_ref.get_value() != order.external_reference:
@@ -133,7 +138,7 @@ def reassert_header(app: FakturamaApp, window, order: OrderData) -> None:
     date_field = find_after_label(window, "Date", "Edit")
     if date_field.get_value() != expected_date_text:
         log.info("Date drifted before save, re-setting")
-        set_text(date_field, expected_date_text)
+        set_segmented_date(date_field, order.order_date)
 
     price_mode = find_price_mode_combo(window)
     if price_mode.legacy_properties()["Value"] != PRICE_MODE_NET:
@@ -165,14 +170,19 @@ def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3) -
     Fakturama-assigned Order number (e.g. "PO000029") for the caller to use
     when verifying the saved record in Data > Documents.
 
-    Date has been observed reverting to today's date from multiple
+    Date was previously observed reverting to today's date from multiple
     distinct triggers (price-mode change, address-dialog interaction, the
-    Save click itself). This retries save if Date is wrong immediately
-    after clicking Save, but does not chase further reversion caused by
-    *subsequent* navigation (e.g. switching to Documents and back) -- that
-    was tried and turned out to revert deterministically, not flakily, so
-    retrying the same sequence never converges. See the KNOWN LIMITATION
-    log message below and project memory for details.
+    Save click itself, and navigating to Documents and back) -- root-caused
+    to Date being written via set_text(), which updates the display text
+    without syncing Fakturama's underlying model. Now written via
+    set_segmented_date() (real per-segment keystrokes, matching how the
+    field's own masked DateTime spinner is actually meant to be operated),
+    which fixed the persistence bug at its source: confirmed live that a
+    date set this way survives repeated navigation to Data > Documents and
+    survives closing and reopening the tab fresh from the database, not
+    just an immediate in-editor read. The retry loop below is kept as
+    cheap defense in depth against drift from some other trigger, not
+    because Date is expected to revert anymore.
     """
     verify_order_totals(window, order)
     save_btn = window.child_window(title="Save the current contents", control_type="Button")
@@ -205,12 +215,6 @@ def save_order(app: FakturamaApp, window, order: OrderData, attempts: int = 3) -
         raise AutomationError("Date kept reverting immediately after save; could not persist the correct Order Date")
 
     log.info("Order saved, Date correct immediately after save")
-    log.info(
-        "KNOWN LIMITATION: Date has been observed reverting to today's date again after "
-        "further navigation away from and back to this tab (e.g. viewing Documents), even "
-        "though it reads correctly right after Save -- not resolved in this session. "
-        "Re-verify Date from a fresh connection before treating this Order as final."
-    )
 
     no_field = find_after_label(window, "No.", "Edit")
     return no_field.get_value()

@@ -1,4 +1,5 @@
 import time
+from datetime import date
 
 import win32con
 import win32gui
@@ -70,6 +71,65 @@ def type_text_via_keyboard(control, text: str) -> None:
     actual = control.get_value()
     if text not in actual:
         raise AutomationError(f"Failed to type text: expected {text!r} in value, got {actual!r}")
+
+
+def set_segmented_date(control, value: date) -> None:
+    """Write a date into Fakturama's masked DateTime spinner (Order/Invoice
+    Date, Invoice Payment Date) via real per-segment keystrokes.
+
+    This field is not a plain masked text box -- it's a genuine SWT
+    DateTime-style spinner with three independently-editable segments
+    (month/day/year). Confirmed live that neither of this project's two
+    general-purpose text-setting helpers works correctly here:
+
+    - set_text() (ValuePattern.SetValue / WM_SETTEXT) writes the display
+      text directly without going through the widget's normal keystroke
+      handling. The field *looks* correct immediately -- and even right
+      after Save -- but silently reverts to today's date the next time
+      anything (e.g. navigating to Data > Documents) makes Fakturama
+      re-render from the underlying, never-actually-updated model. This
+      was the root cause of the long-standing Date-reversion bug (see
+      docs/PROGRESS.md, "Order/Invoice Date field is unstable").
+    - type_text_via_keyboard() (select-all, type the whole formatted
+      string like "Jul 14, 2026") corrupts it instead, producing garbage
+      like "Aug 20, 714" -- the widget doesn't parse a full text string,
+      it expects raw digits typed into whichever segment currently has
+      focus.
+
+    The correct interaction, confirmed live: click into the field (lands
+    on the month segment nearest the click), Home to make sure the cursor
+    is on the month segment, then type exactly 2 digits for month, 2 for
+    day, 4 for year -- each segment auto-advances to the next once full,
+    with no Tab/Right-arrow needed (an earlier attempt using an explicit
+    Right-arrow between segments produced wrong results, e.g. year "0014",
+    because the auto-advance had already moved past the day segment by
+    the time the deliberate Right-arrow fired). This mirrors how a human
+    actually operates the control, which is presumably why manually
+    created Orders never exhibited the reversion bug.
+
+    Confirmed to fix the actual persistence bug, not just the display:
+    the value survives repeated navigation to Data > Documents (the known
+    trigger) and survives closing the tab and reopening a fresh editor
+    from the Documents list -- i.e. the real persisted database record is
+    correct, not just an in-memory tab that happened not to lose focus.
+    """
+    # click_input() with no coords clicks the control's center, which lands
+    # on the day or year segment (not month) once the field already holds
+    # a value wider than a fresh empty one -- confirmed live this produces
+    # garbage like "Aug 17, 720" when the click lands mid-value instead of
+    # on the month segment. Click near the left edge specifically, where
+    # the month segment always starts, then Home for extra certainty.
+    control.click_input(coords=(8, 8))
+    control.type_keys("{HOME}")
+    control.type_keys(f"{value.month:02d}")
+    control.type_keys(f"{value.day:02d}")
+    control.type_keys(f"{value.year:04d}")
+    control.type_keys("{ENTER}")
+
+    expected = f"{value.strftime('%b')} {value.day}, {value.year}"
+    actual = control.get_value()
+    if actual != expected:
+        raise AutomationError(f"Failed to set segmented date: expected {expected!r}, got {actual!r}")
 
 
 def find_after_label(window, label: str, control_type: str = "Edit"):
