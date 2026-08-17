@@ -53,33 +53,16 @@ See `DESIGN.md` for why each layer is built the way it is.
 
 ```text
 src/fakturama_automation/
-├── main.py                    CLI entrypoint: image path in, exit code out
-├── extraction/
-│   └── extractor.py           OpenAI vision call -> OrderData
-├── models/
-│   └── order.py                Pydantic models (OrderData, DebtorData, OrderItem, ...)
-├── validation/
-│   └── order_validator.py     Decimal-based financial/field validation
-├── workflow/
-│   ├── orchestrator.py        the end-to-end flow, phase by phase
-│   └── errors.py              AutomationError / ManualReviewRequired
-├── fakturama/
-│   ├── app.py                 connect/focus/click primitives
-│   ├── controls.py            reusable UIA patterns incl. the clipboard-grid
-│   │                          technique and the segmented-date-field writer
-│   ├── order.py                Order header, totals check, save+verify
-│   ├── debtor.py                Debtor search/create/verify
-│   ├── payment.py               Payment Method search/create/verify
-│   ├── vat.py                   VAT search/create/verify
-│   ├── product.py               Product search/create, Items-table editing
-│   ├── invoice.py               linked Invoice creation, payment application
-│   └── documents.py             saved-record verification
-└── utils/                      logging, wait helpers
+├── main.py          # CLI entry point
+├── extraction/      # Image-to-order extraction
+├── models/          # Pydantic domain models
+├── validation/      # Financial and field validation
+├── workflow/        # End-to-end orchestration
+├── fakturama/       # Fakturama UI automation
+└── utils/           # Logging, waits, and screenshots
 
-tests/                          pytest unit tests (extraction, validation,
-                                 Decimal calculations) — no live Fakturama
-                                 needed to run these
-samples/order.png               sample order image used for testing
+tests/               # Unit tests
+samples/             # Sample order image
 ```
 
 ## Setup
