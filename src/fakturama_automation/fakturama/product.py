@@ -220,7 +220,7 @@ def _row_cell_point(window, row_index: int, x_offset: int) -> tuple[int, int]:
     return x, y
 
 
-def _nudge_items_grid_scrollbar(window, max_clicks: int = 40) -> int:
+def _nudge_items_grid_scrollbar(window, max_clicks: int = 15) -> int:
     """Click the Items grid's own vertical-scrollbar "Line down" button
     repeatedly until it disappears (nothing left to scroll) or max_clicks
     is reached. Returns the number of clicks performed.
